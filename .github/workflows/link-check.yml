@@ -1,0 +1,46 @@
+# Weekly broken-link sweep of the live site. Pulls every URL from the
+# sitemap and checks all links found on those pages. Opens/updates a
+# GitHub issue when something is broken.
+name: Link check
+
+on:
+  schedule:
+    - cron: "30 4 * * 1" # Mondays 04:30 UTC (~10 AM IST)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect page URLs from sitemap
+        run: |
+          curl -s --max-time 30 "https://www.skilloura.com/sitemap.xml" \
+            | grep -oE "<loc>[^<]+</loc>" | sed -E 's#</?loc>##g' > urls.txt
+          wc -l urls.txt
+      - name: Check links on every page
+        id: lychee
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --no-progress --max-concurrency 4 --timeout 20 --max-retries 2
+            --accept 200..=299,403,429
+            --exclude "wa.me" --exclude "api.whatsapp.com" --exclude "linkedin.com" --exclude "x.com"
+            urls.txt
+          fail: true
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "🔗 Broken links found on skilloura.com";
+            const { data: issues } = await github.rest.issues.listForRepo({ owner: context.repo.owner, repo: context.repo.repo, state: "open", labels: "broken-links" });
+            const body = `The weekly link check found broken links. See the run for details: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            if (issues.length === 0) {
+              await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body, labels: ["broken-links"] });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: issues[0].number, body });
+            }

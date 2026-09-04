@@ -1,0 +1,30 @@
+# Performance + accessibility audit of the LIVE site after each deploy
+# (push to main). Warn-only: reports scores without blocking anything.
+name: Lighthouse audit
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Wait for Vercel deploy to go live
+        run: sleep 120
+      - name: Run Lighthouse (home, services, blog)
+        uses: treosh/lighthouse-ci-action@v12
+        with:
+          urls: |
+            https://www.skilloura.com/
+            https://www.skilloura.com/services
+            https://www.skilloura.com/blog
+          uploadArtifacts: true
+          temporaryPublicStorage: true
+      - name: Note
+        run: echo "Scores are in the artifact + links above. Informational only."

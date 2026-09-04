@@ -1,0 +1,28 @@
+# Weekly IndexNow submission — tells search engines (Bing, Yandex, and
+# partners) about our URLs so new blog posts get discovered faster.
+# Note: Google retired its ping endpoint; Google discovers via the
+# sitemap already submitted in Search Console.
+name: IndexNow submit
+
+on:
+  schedule:
+    - cron: "0 5 * * 1" # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Submit sitemap URLs to IndexNow
+        run: |
+          KEY="988b6c02216d39d92b247c86239bf357"
+          urls=$(curl -s --max-time 30 "https://www.skilloura.com/sitemap.xml" | grep -oE "<loc>[^<]+</loc>" | sed -E 's#</?loc>##g' | head -100)
+          list=$(echo "$urls" | sed 's/^/"/;s/$/"/' | paste -sd, -)
+          payload="{\"host\":\"www.skilloura.com\",\"key\":\"$KEY\",\"keyLocation\":\"https://www.skilloura.com/$KEY.txt\",\"urlList\":[$list]}"
+          code=$(curl -s -o /tmp/resp -w "%{http_code}" -X POST "https://api.indexnow.org/IndexNow" -H "Content-Type: application/json; charset=utf-8" -d "$payload")
+          echo "IndexNow response: $code"; cat /tmp/resp || true
+          # 200/202 = accepted
+          case "$code" in 200|202) exit 0;; *) exit 1;; esac

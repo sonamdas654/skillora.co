@@ -1,0 +1,6 @@
+{
+  "name": "Skillora",
+  "description": "Smart digital services platform for building websites, apps, AI automation, designs, dashboards, and digital systems.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,33 @@
+# Dependabot — watches npm packages for updates. Grouped weekly PRs to
+# keep noise low; security advisories additionally trigger immediate PRs
+# (GitHub enables those automatically once this file exists).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      all-minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # Major upgrades of framework-critical packages need a planned,
+      # tested migration — never an automated PR. (Prisma stays on 6.)
+      - dependency-name: "prisma"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@prisma/client"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "next"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tailwindcss"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly

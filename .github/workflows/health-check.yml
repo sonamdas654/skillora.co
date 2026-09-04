@@ -1,0 +1,226 @@
+# 24/7 site health check — runs on GitHub's servers every 6 hours,
+# regardless of whether the owner's laptop is on.
+#
+# On failure it alerts through three independent channels so a problem
+# can't go unnoticed even if GitHub's own email notifications are off:
+#   1. Telegram   (needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)
+#   2. Email      (needs RESEND_API_KEY + ADMIN_EMAIL)
+#   3. A GitHub issue labelled "site-down" (needs nothing)
+# Each channel skips with a notice when its secrets are absent, so a
+# missing secret never turns into a false failure.
+name: Health check
+
+on:
+  schedule:
+    - cron: "17 */6 * * *" # every 6 hours (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check pages, redirects and sitemap
+        run: |
+          BASE="https://www.skilloura.com"
+          fail=0
+          : > problems.txt
+
+          note_fail() { echo "  - $1" >> problems.txt; fail=1; echo "❌ $1"; }
+
+          # GET with retry. Retries only transient failures (5xx / network),
+          # never a deterministic 404 or 30x — so one network blip can't
+          # raise a false alarm, but a real break still fails.
+          get() {
+            url="$1"; follow="$2"
+            code=000
+            for attempt in 1 2 3; do
+              if [ "$follow" = "1" ]; then
+                code=$(curl -sL -o /tmp/body -w "%{http_code}" --max-time 30 "$url" 2>/dev/null || echo 000)
+              else
+                code=$(curl -s -o /tmp/body -w "%{http_code}" --max-time 30 "$url" 2>/dev/null || echo 000)
+              fi
+              case "$code" in 5*|000) [ "$attempt" -lt 3 ] && sleep 5 ;; *) break ;; esac
+            done
+            echo "$code"
+          }
+
+          # -L follows redirects: /start-project -> /get-started and
+          # /client/login -> /login are intentional, so what we assert here
+          # is the health of the page the visitor actually lands on.
+          check() {
+            url="$1"; want="$2"; needle="$3"
+            code=$(get "$url" 1)
+            if [ "$code" != "$want" ]; then note_fail "$url -> $code (expected $want)"; return; fi
+            if [ -n "$needle" ] && ! grep -q -- "$needle" /tmp/body; then
+              note_fail "$url returned 200 but content is missing: '$needle'"; return
+            fi
+            echo "✅ $url -> $code"
+          }
+
+          # Asserts the redirect itself still exists and points where we think.
+          check_redirect() {
+            url="$1"; want_loc="$2"
+            code=$(get "$url" 0)
+            case "$code" in
+              30*) ;;
+              *) note_fail "$url expected a redirect, got $code"; return ;;
+            esac
+            loc=$(curl -s -o /dev/null -w "%{redirect_url}" --max-time 30 "$url" 2>/dev/null)
+            case "$loc" in
+              *"$want_loc"*) echo "✅ $url -> $code -> $loc" ;;
+              *) note_fail "$url redirects to '$loc' (expected to contain '$want_loc')" ;;
+            esac
+          }
+
+          echo "── Key pages ──"
+          # Every needle below is real page content, so a 200 that renders an
+          # empty or error shell is caught instead of silently passing.
+          check "$BASE/"                200 "Skilloura"
+          check "$BASE/services"        200 "Website Development"
+          check "$BASE/pricing"         200 "Guide price"
+          check "$BASE/blog"            200 "min read"
+          check "$BASE/references"      200 "Reference"
+          check "$BASE/start-project"   200 ""
+          check "$BASE/contact"         200 "contact@skilloura.com"
+          check "$BASE/client/login"    200 "Welcome back"
+          check "$BASE/sitemap.xml"     200 "<urlset"
+          check "$BASE/robots.txt"      200 "Sitemap:"
+          check "$BASE/nonexistent-page-xyz-12345" 404 ""
+
+          echo "── Intentional redirects ──"
+          check_redirect "$BASE/start-project" "/get-started"
+          check_redirect "$BASE/client/login"  "/login"
+
+          echo "── Sitemap sweep (every listed URL must return 200) ──"
+          curl -s --max-time 30 "$BASE/sitemap.xml" \
+            | grep -oE "<loc>[^<]+</loc>" | sed -E 's#</?loc>##g' > urls.txt
+          n=$(grep -c . urls.txt || echo 0)
+          echo "sitemap lists $n URLs"
+          if [ "$n" -lt 20 ]; then
+            note_fail "sitemap only lists $n URLs (expected 20+) — generation may be broken"
+          fi
+          while read -r u; do
+            [ -z "$u" ] && continue
+            c=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$u" 2>/dev/null || echo 000)
+            [ "$c" != "200" ] && note_fail "sitemap URL $u -> $c"
+          done < urls.txt
+
+          echo "── Homepage response time (warning only) ──"
+          t=$(curl -s -o /dev/null -w "%{time_total}" --max-time 30 "$BASE/" 2>/dev/null || echo 99)
+          echo "homepage loaded in ${t}s"
+          if [ "$(awk -v x="$t" 'BEGIN{print (x>3)?1:0}')" = "1" ]; then
+            echo "::warning::Homepage took ${t}s (over the 3s comfort threshold)"
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo; echo "Problems found:"; cat problems.txt
+          fi
+          exit $fail
+
+      - name: SSL certificate expiry (fails under 21 days)
+        run: |
+          end=$(echo | openssl s_client -servername www.skilloura.com -connect www.skilloura.com:443 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2)
+          end_epoch=$(date -d "$end" +%s)
+          now_epoch=$(date +%s)
+          days=$(( (end_epoch - now_epoch) / 86400 ))
+          echo "SSL certificate expires in $days days ($end)"
+          if [ "$days" -lt 21 ]; then
+            echo "  - SSL certificate expires in $days days" >> problems.txt
+            echo "❌ SSL certificate expiring soon!"; exit 1
+          fi
+
+      # Warning-only on purpose: SSL auto-renews, the DOMAIN does not, and
+      # losing the domain is unrecoverable — so surface it early. Never fails
+      # the job, because whois output formats vary between registrars and a
+      # parsing quirk must not cause a false alarm.
+      - name: Domain expiry (warning only)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y whois >/dev/null 2>&1 || true
+          raw=$(whois skilloura.com 2>/dev/null | grep -iE "Registry Expiry Date|Expiration Date" | head -1 | sed -E 's/.*: *//')
+          if [ -z "$raw" ]; then echo "Could not read domain expiry from whois — skipping."; exit 0; fi
+          exp_epoch=$(date -d "$raw" +%s 2>/dev/null || echo 0)
+          if [ "$exp_epoch" = "0" ]; then echo "Unrecognised whois date format: $raw"; exit 0; fi
+          days=$(( (exp_epoch - $(date +%s)) / 86400 ))
+          echo "Domain skilloura.com expires in $days days ($raw)"
+          if [ "$days" -lt 45 ]; then
+            echo "::warning::Domain skilloura.com expires in $days days — renew it."
+          fi
+
+      - name: Alert on Telegram
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — skipping Telegram alert."
+            exit 0
+          fi
+          details=$( [ -s problems.txt ] && cat problems.txt || echo "  - see the run log" )
+          msg=$(printf '🚨 skilloura.com health check FAILED\n\n%s\n\n%s' "$details" "$RUN_URL")
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=${msg}" >/dev/null || true
+          echo "Telegram alert sent."
+
+      - name: Alert by email (Resend)
+        if: failure()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$RESEND_API_KEY" ] || [ -z "$ADMIN_EMAIL" ]; then
+            echo "::warning::RESEND_API_KEY / ADMIN_EMAIL not set — skipping email alert."
+            exit 0
+          fi
+          from="${EMAIL_FROM:-Skilloura <onboarding@resend.dev>}"
+          details=$( [ -s problems.txt ] && cat problems.txt || echo "  - see the run log" )
+          html=$(printf '<h2>skilloura.com health check failed</h2><pre>%s</pre><p><a href="%s">View the run</a></p>' "$details" "$RUN_URL")
+          # jq builds the JSON so the message text can never break the payload.
+          payload=$(jq -n --arg from "$from" --arg to "$ADMIN_EMAIL" \
+            --arg subject "🚨 skilloura.com health check FAILED" \
+            --arg html "$html" \
+            '{from:$from, to:$to, subject:$subject, html:$html}')
+          curl -s -X POST "https://api.resend.com/emails" \
+            -H "Authorization: Bearer ${RESEND_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$payload" >/dev/null || true
+          echo "Email alert sent to $ADMIN_EMAIL."
+
+      - name: Open or update a GitHub issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let details = 'See the run log.';
+            try {
+              const t = fs.readFileSync('problems.txt', 'utf8').trim();
+              if (t) details = t;
+            } catch {}
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `The scheduled health check failed.\n\n\`\`\`\n${details}\n\`\`\`\n\n[View the run](${runUrl})`;
+            const title = "🚨 skilloura.com health check failing";
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: "open", labels: "site-down",
+            });
+            if (open.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ["site-down"],
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: open[0].number, body,
+              });
+            }

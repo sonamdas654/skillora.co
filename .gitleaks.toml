@@ -1,0 +1,11 @@
+# Gitleaks config — extends default rules with documented allowlist entries.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known non-secrets"
+regexes = [
+  # IndexNow site-verification key: the protocol REQUIRES this value to be
+  # publicly hosted at /<key>.txt — it is not a credential.
+  '''988b6c02216d39d92b247c86239bf357''',
+]
